@@ -1,0 +1,14 @@
+[project]
+name = "vcc-classifier-jock"
+version = "0.1.0"
+description = "VCC 刷卡適性分類工具 - 分析費用項目並生成 Gamma 簡報"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.6",
+    "uvicorn[standard]>=0.34.0",
+    "pydantic>=2.10.4",
+    "pydantic-settings>=2.7.1",
+    "httpx>=0.28.1",
+    "anthropic>=0.43.0",
+    "python-multipart>=0.0.20",
+]

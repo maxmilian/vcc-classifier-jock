@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VCC 刷卡適性分析工具</title>
+<style>
+  :root {
+    --orange: #EF7A00;
+    --bluegray: #425563;
+    --yellow: #FFC719;
+    --red-orange: #D4573B;
+    --gray-100: #E7E8E9;
+    --gray-600: #828282;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f5; color: #333; }
+  .container { max-width: 900px; margin: 0 auto; padding: 20px; }
+  h1 { color: var(--bluegray); margin-bottom: 8px; font-size: 1.6rem; }
+  .subtitle { color: var(--gray-600); margin-bottom: 24px; }
+  .step { background: #fff; border-radius: 12px; padding: 24px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); display: none; }
+  .step.active { display: block; }
+  .step-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+  .step-number { background: var(--orange); color: #fff; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 0.9rem; }
+  .step-number.done { background: #4caf50; }
+  .step-title { font-size: 1.1rem; font-weight: 600; color: var(--bluegray); }
+  label { display: block; font-weight: 500; margin-bottom: 4px; color: var(--bluegray); }
+  input[type="text"], input[type="file"] { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 0.95rem; margin-bottom: 12px; }
+  input[type="text"]:focus { outline: none; border-color: var(--orange); }
+  .btn { display: inline-block; padding: 10px 24px; border: none; border-radius: 8px; font-size: 0.95rem; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-primary { background: var(--orange); color: #fff; }
+  .btn-primary:hover:not(:disabled) { opacity: 0.9; }
+  .btn-secondary { background: var(--bluegray); color: #fff; }
+  .btn-secondary:hover:not(:disabled) { opacity: 0.9; }
+  .btn-outline { background: #fff; color: var(--orange); border: 2px solid var(--orange); }
+  .error { color: var(--red-orange); font-size: 0.9rem; margin-bottom: 8px; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 16px 0; }
+  .stat-card { background: #f9f9f9; border-radius: 8px; padding: 12px; text-align: center; }
+  .stat-card .value { font-size: 1.5rem; font-weight: 700; color: var(--bluegray); }
+  .stat-card .label { font-size: 0.8rem; color: var(--gray-600); }
+  .stat-card.yes .value { color: #4caf50; }
+  .stat-card.no .value { color: var(--red-orange); }
+  .stat-card.maybe .value { color: var(--yellow); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin: 12px 0; }
+  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #eee; }
+  th { background: var(--bluegray); color: #fff; font-weight: 500; position: sticky; top: 0; }
+  .table-wrap { max-height: 400px; overflow-y: auto; border-radius: 8px; border: 1px solid #eee; }
+  .badge { padding: 2px 8px; border-radius: 12px; font-size: 0.8rem; font-weight: 600; }
+  .badge-yes { background: #e8f5e9; color: #2e7d32; }
+  .badge-no { background: #fce4ec; color: #c62828; }
+  .badge-maybe { background: #fff8e1; color: #f57f17; }
+  .loading { display: none; align-items: center; gap: 8px; color: var(--gray-600); }
+  .loading.show { display: flex; }
+  .spinner { width: 20px; height: 20px; border: 3px solid #eee; border-top-color: var(--orange); border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .progress-bar { width: 100%; height: 6px; background: #eee; border-radius: 3px; overflow: hidden; margin: 8px 0; }
+  .progress-bar .fill { height: 100%; background: var(--orange); transition: width 0.3s; }
+  .stepper { display: flex; gap: 0; margin-bottom: 24px; }
+  .stepper-item { flex: 1; text-align: center; padding: 12px 8px; background: #eee; color: var(--gray-600); font-size: 0.85rem; font-weight: 500; position: relative; }
+  .stepper-item:first-child { border-radius: 8px 0 0 8px; }
+  .stepper-item:last-child { border-radius: 0 8px 8px 0; }
+  .stepper-item.active { background: var(--orange); color: #fff; }
+  .stepper-item.done { background: #4caf50; color: #fff; }
+  .actions { display: flex; gap: 12px; margin-top: 16px; flex-wrap: wrap; align-items: center; }
+  .hint { font-size: 0.85rem; color: var(--gray-600); }
+  .category-section { margin: 12px 0; }
+  .category-title { font-weight: 600; color: var(--bluegray); margin-bottom: 8px; font-size: 0.95rem; }
+  .gamma-result { margin-top: 16px; padding: 16px; background: #f0f7ff; border-radius: 8px; }
+  .gamma-result a { color: var(--orange); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>VCC 刷卡適性分析工具</h1>
+  <p class="subtitle">上傳費用 CSV，自動分析 VCC 適性並生成提案簡報</p>
+
+  <div class="stepper">
+    <div class="stepper-item active" id="stepper-1">1. 上傳資料</div>
+    <div class="stepper-item" id="stepper-2">2. 分析結果</div>
+    <div class="stepper-item" id="stepper-3">3. 生成簡報</div>
+  </div>
+
+  <!-- Step 1 -->
+  <div class="step active" id="step1">
+    <div class="step-header">
+      <div class="step-number">1</div>
+      <div class="step-title">上傳客戶費用 CSV</div>
+    </div>
+    <label for="companyName">公司名稱</label>
+    <input type="text" id="companyName" placeholder="例：出口設計有限公司">
+    <label for="taxId">統一編號</label>
+    <input type="text" id="taxId" placeholder="例：12345678">
+    <label for="csvFile">費用 CSV 檔案</label>
+    <input type="file" id="csvFile" accept=".csv">
+    <p class="error" id="step1Error"></p>
+    <div class="loading" id="step1Loading">
+      <div class="spinner"></div>
+      <span>正在分析中，請稍候...</span>
+    </div>
+    <button class="btn btn-primary" id="btnAnalyze" onclick="analyze()">開始分析</button>
+  </div>
+
+  <!-- Step 2 -->
+  <div class="step" id="step2">
+    <div class="step-header">
+      <div class="step-number">2</div>
+      <div class="step-title">VCC 適性分析結果</div>
+    </div>
+    <div class="stats" id="statsArea"></div>
+    <div class="table-wrap">
+      <table id="resultTable">
+        <thead><tr><th>費用項目名稱</th><th>金額累計</th><th>交易筆數</th><th>VCC判斷</th></tr></thead>
+        <tbody id="resultBody"></tbody>
+      </table>
+    </div>
+    <div class="actions">
+      <button class="btn btn-secondary" id="btnDownload" onclick="downloadCsv()">下載分析 CSV</button>
+      <button class="btn btn-primary" id="btnNext" onclick="goToStep3()" disabled>下一步：生成簡報</button>
+      <span id="downloadHint" class="hint">請先下載 CSV 確認結果</span>
+    </div>
+  </div>
+
+  <!-- Step 3 -->
+  <div class="step" id="step3">
+    <div class="step-header">
+      <div class="step-number">3</div>
+      <div class="step-title">分類 & Gamma 簡報生成</div>
+    </div>
+    <div id="categoryArea"></div>
+    <div class="loading" id="step3Loading">
+      <div class="spinner"></div>
+      <span id="step3Status">正在分類並生成簡報...</span>
+    </div>
+    <div class="progress-bar" id="progressBar" style="display:none"><div class="fill" id="progressFill"></div></div>
+    <button class="btn btn-primary" id="btnGenerate" onclick="generatePresentation()">開始生成簡報</button>
+    <div class="gamma-result" id="gammaResult" style="display:none"></div>
+  </div>
+</div>
+
+<script>
+let analyzeResult = null;
+let categorizeResult = null;
+
+function setStep(n) {
+  for (let i = 1; i <= 3; i++) {
+    document.getElementById(`step${i}`).classList.toggle('active', i === n);
+    const s = document.getElementById(`stepper-${i}`);
+    s.classList.remove('active', 'done');
+    if (i < n) s.classList.add('done');
+    else if (i === n) s.classList.add('active');
+  }
+}
+
+function formatNumber(n) {
+  return Number(n).toLocaleString('zh-TW', { maximumFractionDigits: 0 });
+}
+
+function badgeClass(v) {
+  if (v === '可以') return 'badge-yes';
+  if (v === '不行') return 'badge-no';
+  return 'badge-maybe';
+}
+
+async function analyze() {
+  const name = document.getElementById('companyName').value.trim();
+  const taxId = document.getElementById('taxId').value.trim();
+  const file = document.getElementById('csvFile').files[0];
+  const errEl = document.getElementById('step1Error');
+  errEl.textContent = '';
+
+  if (!name || !taxId || !file) {
+    errEl.textContent = '請填寫所有欄位並上傳 CSV 檔案';
+    return;
+  }
+
+  const btn = document.getElementById('btnAnalyze');
+  btn.disabled = true;
+  document.getElementById('step1Loading').classList.add('show');
+
+  const fd = new FormData();
+  fd.append('company_name', name);
+  fd.append('tax_id', taxId);
+  fd.append('file', file);
+
+  try {
+    const res = await fetch('/api/analyze', { method: 'POST', body: fd });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.detail || '分析失敗');
+    }
+    analyzeResult = await res.json();
+    renderStep2();
+    setStep(2);
+  } catch (e) {
+    errEl.textContent = e.message;
+  } finally {
+    btn.disabled = false;
+    document.getElementById('step1Loading').classList.remove('show');
+  }
+}
+
+function renderStep2() {
+  const r = analyzeResult;
+  document.getElementById('statsArea').innerHTML = `
+    <div class="stat-card"><div class="value">${r.total_items}</div><div class="label">總項目數</div></div>
+    <div class="stat-card yes"><div class="value">${r.vcc_yes}</div><div class="label">可以</div></div>
+    <div class="stat-card no"><div class="value">${r.vcc_no}</div><div class="label">不行</div></div>
+    <div class="stat-card maybe"><div class="value">${r.vcc_maybe}</div><div class="label">不確定</div></div>
+  `;
+  const tbody = document.getElementById('resultBody');
+  tbody.innerHTML = r.items.map(item => `
+    <tr>
+      <td>${item['費用項目名稱'] || ''}</td>
+      <td>${formatNumber(item['金額累計'] || 0)}</td>
+      <td>${item['交易筆數'] || ''}</td>
+      <td><span class="badge ${badgeClass(item['VCC判斷'])}">${item['VCC判斷'] || ''}</span></td>
+    </tr>
+  `).join('');
+}
+
+function downloadCsv() {
+  if (!analyzeResult) return;
+  window.open(`/api/download/${encodeURIComponent(analyzeResult.filename)}`);
+  document.getElementById('btnNext').disabled = false;
+  document.getElementById('downloadHint').style.display = 'none';
+}
+
+function goToStep3() {
+  setStep(3);
+}
+
+async function generatePresentation() {
+  if (!analyzeResult) return;
+  const btn = document.getElementById('btnGenerate');
+  btn.disabled = true;
+  btn.style.display = 'none';
+  document.getElementById('step3Loading').classList.add('show');
+  document.getElementById('progressBar').style.display = 'block';
+  document.getElementById('progressFill').style.width = '10%';
+  document.getElementById('step3Status').textContent = '正在用 AI 分類費用項目...';
+
+  const vccItems = analyzeResult.items.filter(i => i['VCC判斷'] === '可以');
+
+  try {
+    // Step 3a: Categorize (done server-side in generate-presentation)
+    document.getElementById('progressFill').style.width = '30%';
+    document.getElementById('step3Status').textContent = '正在生成簡報 Markdown...';
+
+    const res = await fetch('/api/generate-presentation', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        company_name: analyzeResult.company_name,
+        vcc_items: vccItems,
+        categories: {},
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.detail || '生成失敗');
+    }
+
+    const result = await res.json();
+    document.getElementById('progressFill').style.width = '70%';
+
+    // 如果需要 polling
+    if (result.generation_id && result.status !== 'completed') {
+      document.getElementById('step3Status').textContent = '簡報生成中，請稍候...';
+      await pollGammaStatus(result.generation_id);
+    } else {
+      showGammaResult(result);
+    }
+  } catch (e) {
+    document.getElementById('step3Status').textContent = `錯誤: ${e.message}`;
+  } finally {
+    document.getElementById('step3Loading').classList.remove('show');
+  }
+}
+
+async function pollGammaStatus(generationId) {
+  let progress = 70;
+  while (true) {
+    await new Promise(r => setTimeout(r, 3000));
+    progress = Math.min(progress + 5, 95);
+    document.getElementById('progressFill').style.width = `${progress}%`;
+
+    const res = await fetch(`/api/gamma-status/${generationId}`);
+    const result = await res.json();
+
+    if (result.status === 'completed' || result.status === 'failed') {
+      showGammaResult(result);
+      return;
+    }
+  }
+}
+
+function showGammaResult(result) {
+  document.getElementById('progressFill').style.width = '100%';
+  const el = document.getElementById('gammaResult');
+  el.style.display = 'block';
+
+  if (result.status === 'completed') {
+    let html = '<h3 style="margin-bottom:8px;color:#4caf50">簡報生成完成！</h3>';
+    if (result.gamma_url) {
+      html += `<p><a href="${result.gamma_url}" target="_blank">在 Gamma 中檢視簡報 →</a></p>`;
+    }
+    if (result.export_url) {
+      html += `<p><a href="${result.export_url}" target="_blank">下載 PPTX 檔案 →</a></p>`;
+    }
+    el.innerHTML = html;
+  } else {
+    el.innerHTML = `<p style="color:#c62828">簡報生成失敗，請稍後再試。</p>`;
+  }
+}
+</script>
+</body>
+</html>
