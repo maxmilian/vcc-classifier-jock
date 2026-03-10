@@ -8,22 +8,26 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-PROJECT_ID="cobalt-anchor-267306"
-SERVICE_NAME="vcc-classifier-jock"
-REGION="asia-east1"
-
-ARTIFACT_PROJECT_ID="commeet-artifacts-repo"
-ARTIFACT_REGION="asia-east1"
-ARTIFACT_REPO="commeet-docker-repo-1"
-
 # 讀取 .env
 if [ -f .env ]; then
     echo -e "${BLUE}ℹ 從 .env 檔案讀取設定...${NC}"
     source .env 2>/dev/null
 fi
 
+# GCP 部署設定（可透過 .env 或環境變數覆蓋）
+PROJECT_ID="${GCP_PROJECT_ID:-}"
+SERVICE_NAME="${SERVICE_NAME:-vcc-classifier-jock}"
+REGION="${REGION:-asia-east1}"
+
+ARTIFACT_PROJECT_ID="${ARTIFACT_PROJECT_ID:-}"
+ARTIFACT_REGION="${ARTIFACT_REGION:-asia-east1}"
+ARTIFACT_REPO="${ARTIFACT_REPO:-}"
+
 # 驗證必要變數
 MISSING=""
+[ -z "$PROJECT_ID" ] && MISSING="$MISSING GCP_PROJECT_ID"
+[ -z "$ARTIFACT_PROJECT_ID" ] && MISSING="$MISSING ARTIFACT_PROJECT_ID"
+[ -z "$ARTIFACT_REPO" ] && MISSING="$MISSING ARTIFACT_REPO"
 [ -z "$ANTHROPIC_API_KEY" ] && MISSING="$MISSING ANTHROPIC_API_KEY"
 [ -z "$GAMMA_API_KEY" ] && MISSING="$MISSING GAMMA_API_KEY"
 
