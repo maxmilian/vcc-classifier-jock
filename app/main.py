@@ -2,9 +2,7 @@ import asyncio
 import json
 import logging
 import math
-import tempfile
-import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -12,7 +10,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.services import categorizer, classifier
+from app.services import categorizer, classifier, job_manager
 from app.services.gamma import check_status, generate_presentation
 from app.services.llm import complete as llm_complete
 
@@ -21,19 +19,12 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="VCC Classifier Jock", version="0.1.0")
 
-# 暫存目錄
-TEMP_DIR = Path(tempfile.gettempdir()) / "vcc-classifier"
-TEMP_DIR.mkdir(exist_ok=True)
-JOB_CACHE_DIR = TEMP_DIR / "analyze-jobs"
-JOB_CACHE_DIR.mkdir(exist_ok=True)
-
 # 靜態檔案
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 ANALYZE_BATCH_SIZE = classifier.DEFAULT_BATCH_SIZE
 ESTIMATED_SECONDS_PER_BATCH = 12
 
-ANALYZE_JOBS: dict[str, dict] = {}
 VCC_LEVELS = {"絕對適合", "高度適合", "條件適合", "需釐清", "不適合"}
 PPT_ELIGIBLE_LEVELS = {"絕對適合", "高度適合", "條件適合"}
 
@@ -54,72 +45,6 @@ def _normalize_row_vcc_fields(row: dict) -> dict:
 def _is_ppt_candidate(row: dict) -> bool:
     level = str(row.get("VCC適用等級", "")).strip()
     return level in PPT_ELIGIBLE_LEVELS
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _job_cache_path(job_id: str) -> Path:
-    return JOB_CACHE_DIR / f"{job_id}.json"
-
-
-def _save_job_cache(job: dict) -> None:
-    serializable = dict(job)
-    serializable.pop("_task", None)
-    _job_cache_path(job["job_id"]).write_text(
-        json.dumps(serializable, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-def _append_stage_log(job: dict, phase: str, message: str, extra: dict | None = None) -> None:
-    log = {
-        "time": _now_iso(),
-        "phase": phase,
-        "message": message,
-    }
-    if extra:
-        log["extra"] = extra
-    job["stage_logs"].append(log)
-    # 避免日誌無限膨脹
-    if len(job["stage_logs"]) > 200:
-        job["stage_logs"] = job["stage_logs"][-200:]
-
-
-def _public_job_payload(job: dict) -> dict:
-    payload = {
-        "job_id": job["job_id"],
-        "status": job["status"],
-        "phase": job["phase"],
-        "created_at": job["created_at"],
-        "started_at": job.get("started_at"),
-        "finished_at": job.get("finished_at"),
-        "updated_at": job["updated_at"],
-        "total_rows": job["total_rows"],
-        "unique_items": job["unique_items"],
-        "total_batches": job["total_batches"],
-        "processed_batches": job["processed_batches"],
-        "progress_pct": job["progress_pct"],
-        "estimated_seconds": job["estimated_seconds"],
-        "estimated_seconds_remaining": job.get("estimated_seconds_remaining", 0),
-        "stage_logs": job.get("stage_logs", []),
-        "batch_logs": job.get("batch_logs", []),
-        "error": job.get("error"),
-        "cache_file": job.get("cache_file", ""),
-        "result": job.get("result"),
-    }
-    return payload
-
-
-def _find_job(job_id: str) -> dict | None:
-    job = ANALYZE_JOBS.get(job_id)
-    if job is not None:
-        return job
-    path = _job_cache_path(job_id)
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return None
 
 
 def _build_analyze_result(merged_rows: list[dict], filename: str) -> dict:
@@ -164,20 +89,20 @@ def _build_analyze_result(merged_rows: list[dict], filename: str) -> dict:
 
 
 async def _run_analyze_job(job_id: str, rows: list[dict]) -> None:
-    job = ANALYZE_JOBS.get(job_id)
+    job = job_manager.get_active_job(job_id)
     if job is None:
         return
 
     try:
         job["status"] = "running"
         job["phase"] = "preparing"
-        job["started_at"] = _now_iso()
-        job["updated_at"] = _now_iso()
-        _append_stage_log(job, "preparing", "開始前處理與批次初始化")
-        _save_job_cache(job)
+        job["started_at"] = job_manager.now_iso()
+        job["updated_at"] = job_manager.now_iso()
+        job_manager.append_stage_log(job, "preparing", "開始前處理與批次初始化")
+        job_manager.save_job_cache(job)
 
         async def on_batch_progress(progress: dict) -> None:
-            active = ANALYZE_JOBS.get(job_id)
+            active = job_manager.get_active_job(job_id)
             if active is None:
                 return
 
@@ -192,9 +117,9 @@ async def _run_analyze_job(job_id: str, rows: list[dict]) -> None:
                 0, (total_batches - batch_idx) * ESTIMATED_SECONDS_PER_BATCH
             )
             active["batch_logs"].append(record)
-            active["updated_at"] = _now_iso()
+            active["updated_at"] = job_manager.now_iso()
 
-            _append_stage_log(
+            job_manager.append_stage_log(
                 active,
                 "classifying",
                 f"批次 {batch_idx}/{total_batches} 完成",
@@ -205,7 +130,7 @@ async def _run_analyze_job(job_id: str, rows: list[dict]) -> None:
                     "fallback_count": record.get("fallback_count", 0),
                 },
             )
-            _save_job_cache(active)
+            job_manager.save_job_cache(active)
 
         merged, meta = await classifier.classify_items_in_batches(
             rows=rows,
@@ -215,14 +140,14 @@ async def _run_analyze_job(job_id: str, rows: list[dict]) -> None:
 
         job["phase"] = "merging"
         job["progress_pct"] = 95.0
-        job["updated_at"] = _now_iso()
-        _append_stage_log(job, "merging", "批次分析完成，開始彙整輸出")
-        _save_job_cache(job)
+        job["updated_at"] = job_manager.now_iso()
+        job_manager.append_stage_log(job, "merging", "批次分析完成，開始彙整輸出")
+        job_manager.save_job_cache(job)
 
         csv_content = classifier.to_csv_string(merged)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"VCC分析結果_{ts}.csv"
-        filepath = TEMP_DIR / filename
+        filepath = job_manager.TEMP_DIR / filename
         filepath.write_text(csv_content, encoding="utf-8-sig")
 
         result_payload = _build_analyze_result(merged, filename)
@@ -232,26 +157,26 @@ async def _run_analyze_job(job_id: str, rows: list[dict]) -> None:
         job["phase"] = "completed"
         job["progress_pct"] = 100.0
         job["estimated_seconds_remaining"] = 0
-        job["updated_at"] = _now_iso()
-        job["finished_at"] = _now_iso()
+        job["updated_at"] = job_manager.now_iso()
+        job["finished_at"] = job_manager.now_iso()
         job["result"] = result_payload
-        _append_stage_log(
+        job_manager.append_stage_log(
             job,
             "completed",
             "分析完成，可下載 CSV 或進入簡報流程",
             {"filename": filename},
         )
-        _save_job_cache(job)
+        job_manager.save_job_cache(job)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Analyze job failed: %s", job_id)
         job["status"] = "failed"
         job["phase"] = "failed"
         job["progress_pct"] = 100.0
-        job["updated_at"] = _now_iso()
-        job["finished_at"] = _now_iso()
+        job["updated_at"] = job_manager.now_iso()
+        job["finished_at"] = job_manager.now_iso()
         job["error"] = str(exc)
-        _append_stage_log(job, "failed", "分析失敗", {"error": str(exc)})
-        _save_job_cache(job)
+        job_manager.append_stage_log(job, "failed", "分析失敗", {"error": str(exc)})
+        job_manager.save_job_cache(job)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -288,45 +213,21 @@ async def analyze(file: UploadFile = File(...)):
 
     total_batches = math.ceil(unique_count / ANALYZE_BATCH_SIZE)
     estimated_seconds = max(10, total_batches * ESTIMATED_SECONDS_PER_BATCH)
-    job_id = uuid.uuid4().hex[:12]
-    created_at = _now_iso()
-
-    job = {
-        "job_id": job_id,
-        "status": "queued",
-        "phase": "queued",
-        "created_at": created_at,
-        "started_at": None,
-        "finished_at": None,
-        "updated_at": created_at,
-        "total_rows": len(rows),
-        "unique_items": unique_count,
-        "total_batches": total_batches,
-        "processed_batches": 0,
-        "progress_pct": 0.0,
-        "estimated_seconds": estimated_seconds,
-        "estimated_seconds_remaining": estimated_seconds,
-        "batch_logs": [],
-        "stage_logs": [],
-        "result": None,
-        "error": None,
-        "cache_file": str(_job_cache_path(job_id)),
-    }
-    _append_stage_log(
-        job,
-        "queued",
-        "任務已建立，等待開始分析",
-        {
-            "total_rows": len(rows),
-            "unique_items": unique_count,
-            "total_batches": total_batches,
-            "estimated_seconds": estimated_seconds,
-        },
+    job = job_manager.create_analyze_job(
+        total_rows=len(rows),
+        unique_items=unique_count,
+        total_batches=total_batches,
+        estimated_seconds=estimated_seconds,
     )
-    ANALYZE_JOBS[job_id] = job
-    _save_job_cache(job)
+    job_id = job["job_id"]
 
-    job["_task"] = asyncio.create_task(_run_analyze_job(job_id=job_id, rows=rows))
+    task = asyncio.create_task(_run_analyze_job(job_id=job_id, rows=rows))
+    task.add_done_callback(
+        lambda finished_task, current_job_id=job_id: job_manager.on_analyze_task_done(
+            current_job_id, finished_task
+        )
+    )
+    job_manager.set_job_task(job_id, task)
 
     return {
         "job_id": job_id,
@@ -344,16 +245,16 @@ async def analyze(file: UploadFile = File(...)):
 @app.get("/api/analyze-jobs/{job_id}")
 async def analyze_job_status(job_id: str):
     """查詢分析任務狀態與逐段快取紀錄。"""
-    job = _find_job(job_id)
+    job = job_manager.find_job(job_id)
     if job is None:
         raise HTTPException(404, detail="找不到分析任務")
-    return _public_job_payload(job)
+    return job_manager.public_job_payload(job)
 
 
 @app.get("/api/analyze-jobs/{job_id}/cache")
 async def download_analyze_job_cache(job_id: str):
     """下載分析任務快取紀錄(JSON)。"""
-    cache_path = _job_cache_path(job_id)
+    cache_path = job_manager.job_cache_path(job_id)
     if not cache_path.exists():
         raise HTTPException(404, detail="快取紀錄不存在")
     filename = f"analyze_job_{job_id}.json"
@@ -433,7 +334,7 @@ async def prepare_presentation_csv(
 @app.get("/api/download/{filename}")
 async def download(filename: str):
     """下載分析 CSV。"""
-    filepath = TEMP_DIR / filename
+    filepath = job_manager.TEMP_DIR / filename
     if not filepath.exists():
         raise HTTPException(404, detail="檔案不存在")
     encoded = quote(filename)
