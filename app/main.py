@@ -7,9 +7,12 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.config import settings
+from app.errors import AppError, map_http_error_code
 from app.services import categorizer, classifier, job_manager
 from app.services.gamma import check_status, generate_presentation
 from app.services.llm import complete as llm_complete
@@ -22,21 +25,142 @@ app = FastAPI(title="VCC Classifier Jock", version="0.1.0")
 # 靜態檔案
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
-ANALYZE_BATCH_SIZE = classifier.DEFAULT_BATCH_SIZE
+ANALYZE_BATCH_SIZE = max(1, int(settings.analyze_batch_size))
+ANALYZE_MAX_TOKENS = max(256, int(settings.analyze_max_tokens))
+PPT_MARKDOWN_MAX_TOKENS = max(512, int(settings.ppt_markdown_max_tokens))
+GAMMA_INPUT_MAX_CHARS = max(0, int(settings.gamma_input_max_chars))
 ESTIMATED_SECONDS_PER_BATCH = 12
 
 VCC_LEVELS = {"絕對適合", "高度適合", "條件適合", "需釐清", "不適合"}
 PPT_ELIGIBLE_LEVELS = {"絕對適合", "高度適合", "條件適合"}
+VCC_JUDGE_STATUSES = {
+    classifier.JUDGE_STATUS_MODEL,
+    "外部匯入",
+    classifier.JUDGE_STATUS_FALLBACK,
+    classifier.JUDGE_STATUS_UNANALYZED,
+    "分析失敗",
+}
+
+
+@app.exception_handler(AppError)
+async def app_error_handler(_, exc: AppError):
+    return JSONResponse(status_code=exc.status_code, content=exc.to_payload())
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_, exc: HTTPException):
+    if isinstance(exc.detail, dict):
+        detail = exc.detail
+        if "error_code" in detail:
+            return JSONResponse(status_code=exc.status_code, content=detail)
+        message = str(detail.get("message", "")).strip() or "請求失敗"
+    else:
+        message = str(exc.detail).strip() if exc.detail else "請求失敗"
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error_code": map_http_error_code(exc.status_code),
+            "message": message,
+            "retryable": exc.status_code in {408, 429, 502, 503, 504},
+        },
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(_, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error_code": "INVALID_REQUEST",
+            "message": f"請求格式不正確: {exc.errors()}",
+            "retryable": False,
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(_, exc: Exception):
+    logger.exception("Unhandled API exception: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error_code": "INTERNAL_ERROR",
+            "message": "系統發生未預期錯誤，請稍後再試。",
+            "retryable": True,
+        },
+    )
+
+
+def _count_vcc_metrics(rows: list[dict]) -> tuple[dict[str, int], dict[str, int]]:
+    vcc_level_counts = {
+        "絕對適合": 0,
+        "高度適合": 0,
+        "條件適合": 0,
+        "需釐清": 0,
+        "不適合": 0,
+    }
+    vcc_status_counts = {
+        classifier.JUDGE_STATUS_MODEL: 0,
+        "外部匯入": 0,
+        classifier.JUDGE_STATUS_FALLBACK: 0,
+        classifier.JUDGE_STATUS_UNANALYZED: 0,
+        "分析失敗": 0,
+    }
+
+    for row in rows:
+        level = str(row.get("VCC適用等級", "")).strip()
+        if level in vcc_level_counts:
+            vcc_level_counts[level] += 1
+
+        status = str(row.get("VCC判定狀態", "")).strip()
+        if not status:
+            status = (
+                classifier.JUDGE_STATUS_MODEL
+                if level in VCC_LEVELS
+                else classifier.JUDGE_STATUS_UNANALYZED
+            )
+        if status not in vcc_status_counts:
+            status = classifier.JUDGE_STATUS_UNANALYZED
+        vcc_status_counts[status] += 1
+
+    return vcc_level_counts, vcc_status_counts
+
+
+def _validate_gamma_input_length(markdown_content: str) -> None:
+    if GAMMA_INPUT_MAX_CHARS <= 0:
+        return
+    actual = len(markdown_content)
+    if actual <= GAMMA_INPUT_MAX_CHARS:
+        return
+    raise AppError(
+        status_code=413,
+        error_code="GAMMA_INPUT_TOO_LARGE",
+        message=(
+            f"Gamma 輸入長度 {actual} 超過上限 {GAMMA_INPUT_MAX_CHARS} 字元，"
+            "請精簡內容或分段生成。"
+        ),
+        retryable=False,
+    )
 
 
 def _normalize_row_vcc_fields(row: dict) -> dict:
     new_row = dict(row)
     level = str(new_row.get("VCC適用等級", "")).strip()
+    status = str(new_row.get("VCC判定狀態", "")).strip()
 
     if level in VCC_LEVELS:
         new_row["VCC適用等級"] = level
+        if status in VCC_JUDGE_STATUSES:
+            new_row["VCC判定狀態"] = status
+        else:
+            new_row["VCC判定狀態"] = "外部匯入"
     else:
-        new_row["VCC適用等級"] = "需釐清"
+        new_row["VCC適用等級"] = ""
+        if status in VCC_JUDGE_STATUSES:
+            new_row["VCC判定狀態"] = status
+        else:
+            new_row["VCC判定狀態"] = classifier.JUDGE_STATUS_UNANALYZED
 
     new_row.pop("VCC判斷", None)
     return new_row
@@ -62,17 +186,7 @@ def _build_analyze_result(merged_rows: list[dict], filename: str) -> dict:
     else:
         company_name = "未命名公司"
 
-    vcc_level_counts = {
-        "絕對適合": 0,
-        "高度適合": 0,
-        "條件適合": 0,
-        "需釐清": 0,
-        "不適合": 0,
-    }
-    for row in merged_rows:
-        level = str(row.get("VCC適用等級", "")).strip()
-        if level in vcc_level_counts:
-            vcc_level_counts[level] += 1
+    vcc_level_counts, vcc_status_counts = _count_vcc_metrics(merged_rows)
 
     ppt_candidate_items = sum(1 for row in merged_rows if _is_ppt_candidate(row))
 
@@ -82,6 +196,7 @@ def _build_analyze_result(merged_rows: list[dict], filename: str) -> dict:
         "filename": filename,
         "total_items": len(merged_rows),
         "vcc_level_counts": vcc_level_counts,
+        "vcc_status_counts": vcc_status_counts,
         "ppt_candidate_items": ppt_candidate_items,
         "items": merged_rows,
         "source_mode": "analyze",
@@ -135,6 +250,7 @@ async def _run_analyze_job(job_id: str, rows: list[dict]) -> None:
         merged, meta = await classifier.classify_items_in_batches(
             rows=rows,
             batch_size=ANALYZE_BATCH_SIZE,
+            max_tokens=ANALYZE_MAX_TOKENS,
             progress_callback=on_batch_progress,
         )
 
@@ -198,9 +314,19 @@ async def analyze(file: UploadFile = File(...)):
 
     missing = classifier.validate_csv_columns(rows)
     if missing:
-        raise HTTPException(400, detail=f"CSV 缺少必要欄位: {', '.join(missing)}")
+        raise AppError(
+            status_code=400,
+            error_code="INVALID_CSV_COLUMNS",
+            message=f"CSV 缺少必要欄位: {', '.join(missing)}",
+            retryable=False,
+        )
     if not rows:
-        raise HTTPException(400, detail="CSV 無資料列")
+        raise AppError(
+            status_code=400,
+            error_code="EMPTY_CSV",
+            message="CSV 無資料列",
+            retryable=False,
+        )
 
     unique_items = {
         str(row.get("費用項目名稱", "")).strip()
@@ -209,7 +335,12 @@ async def analyze(file: UploadFile = File(...)):
     }
     unique_count = len(unique_items)
     if unique_count == 0:
-        raise HTTPException(400, detail="CSV 沒有有效的費用項目名稱")
+        raise AppError(
+            status_code=400,
+            error_code="EMPTY_ANALYZE_ITEMS",
+            message="CSV 沒有有效的費用項目名稱",
+            retryable=False,
+        )
 
     total_batches = math.ceil(unique_count / ANALYZE_BATCH_SIZE)
     estimated_seconds = max(10, total_batches * ESTIMATED_SECONDS_PER_BATCH)
@@ -233,6 +364,7 @@ async def analyze(file: UploadFile = File(...)):
         "job_id": job_id,
         "status": job["status"],
         "phase": job["phase"],
+        "created_at": job["created_at"],
         "total_rows": job["total_rows"],
         "unique_items": job["unique_items"],
         "batch_size": ANALYZE_BATCH_SIZE,
@@ -247,7 +379,12 @@ async def analyze_job_status(job_id: str):
     """查詢分析任務狀態與逐段快取紀錄。"""
     job = job_manager.find_job(job_id)
     if job is None:
-        raise HTTPException(404, detail="找不到分析任務")
+        raise AppError(
+            status_code=404,
+            error_code="ANALYZE_JOB_NOT_FOUND",
+            message="找不到分析任務",
+            retryable=False,
+        )
     return job_manager.public_job_payload(job)
 
 
@@ -256,7 +393,12 @@ async def download_analyze_job_cache(job_id: str):
     """下載分析任務快取紀錄(JSON)。"""
     cache_path = job_manager.job_cache_path(job_id)
     if not cache_path.exists():
-        raise HTTPException(404, detail="快取紀錄不存在")
+        raise AppError(
+            status_code=404,
+            error_code="ANALYZE_JOB_CACHE_NOT_FOUND",
+            message="快取紀錄不存在",
+            retryable=False,
+        )
     filename = f"analyze_job_{job_id}.json"
     encoded = quote(filename)
     return FileResponse(
@@ -276,15 +418,30 @@ async def prepare_presentation_csv(
     rows = classifier.parse_csv(content)
 
     if not rows:
-        raise HTTPException(400, detail="CSV 無資料列")
+        raise AppError(
+            status_code=400,
+            error_code="EMPTY_CSV",
+            message="CSV 無資料列",
+            retryable=False,
+        )
 
     required = {"費用項目名稱", "金額累計", "交易筆數"}
     existing = set(rows[0].keys())
     missing = sorted(required - existing)
     if missing:
-        raise HTTPException(400, detail=f"CSV 缺少必要欄位: {', '.join(missing)}")
+        raise AppError(
+            status_code=400,
+            error_code="INVALID_CSV_COLUMNS",
+            message=f"CSV 缺少必要欄位: {', '.join(missing)}",
+            retryable=False,
+        )
     if "VCC適用等級" not in existing:
-        raise HTTPException(400, detail="CSV 需包含 VCC適用等級 欄位")
+        raise AppError(
+            status_code=400,
+            error_code="INVALID_CSV_COLUMNS",
+            message="CSV 需包含 VCC適用等級 欄位",
+            retryable=False,
+        )
 
     rows = [_normalize_row_vcc_fields(row) for row in rows]
 
@@ -300,23 +457,15 @@ async def prepare_presentation_csv(
             company_name = "未命名公司"
 
     total = len(rows)
-    vcc_level_counts = {
-        "絕對適合": 0,
-        "高度適合": 0,
-        "條件適合": 0,
-        "需釐清": 0,
-        "不適合": 0,
-    }
-    for row in rows:
-        level = str(row.get("VCC適用等級", "")).strip()
-        if level in vcc_level_counts:
-            vcc_level_counts[level] += 1
+    vcc_level_counts, vcc_status_counts = _count_vcc_metrics(rows)
     ppt_candidate_items = sum(1 for r in rows if _is_ppt_candidate(r))
 
     if ppt_candidate_items == 0:
-        raise HTTPException(
-            400,
-            detail="此檔案沒有可產生簡報的項目（需要 VCC適用等級為絕對適合/高度適合/條件適合）",
+        raise AppError(
+            status_code=400,
+            error_code="NO_PPT_CANDIDATES",
+            message="此檔案沒有可產生簡報的項目（需要 VCC適用等級為絕對適合/高度適合/條件適合）",
+            retryable=False,
         )
 
     return {
@@ -325,6 +474,7 @@ async def prepare_presentation_csv(
         "filename": "",
         "total_items": total,
         "vcc_level_counts": vcc_level_counts,
+        "vcc_status_counts": vcc_status_counts,
         "ppt_candidate_items": ppt_candidate_items,
         "items": rows,
         "source_mode": "ppt_ready",
@@ -336,9 +486,19 @@ async def download(filename: str):
     """下載分析 CSV。"""
     filepath = (job_manager.TEMP_DIR / filename).resolve()
     if not filepath.is_relative_to(job_manager.TEMP_DIR.resolve()):
-        raise HTTPException(400, detail="無效的檔案名稱")
+        raise AppError(
+            status_code=400,
+            error_code="INVALID_FILENAME",
+            message="無效的檔案名稱",
+            retryable=False,
+        )
     if not filepath.exists():
-        raise HTTPException(404, detail="檔案不存在")
+        raise AppError(
+            status_code=404,
+            error_code="FILE_NOT_FOUND",
+            message="檔案不存在",
+            retryable=False,
+        )
     encoded = quote(filename)
     return FileResponse(
         filepath,
@@ -356,13 +516,24 @@ async def generate_ppt(data: dict):
     vcc_items = data.get("vcc_items", [])
 
     if not company_name:
-        raise HTTPException(400, detail="缺少 company_name")
+        raise AppError(
+            status_code=400,
+            error_code="INVALID_REQUEST",
+            message="缺少 company_name",
+            retryable=False,
+        )
     if not vcc_items:
-        raise HTTPException(400, detail="無 VCC 可行項目")
+        raise AppError(
+            status_code=400,
+            error_code="NO_PPT_CANDIDATES",
+            message="無 VCC 可行項目",
+            retryable=False,
+        )
 
     generated = await _build_presentation_markdown(company_name=company_name, vcc_items=vcc_items)
     presentation_markdown = generated["markdown_preview"]
     categories = generated["categories"]
+    _validate_gamma_input_length(presentation_markdown)
 
     # 呼叫 Gamma API
     result = await generate_presentation(
@@ -387,7 +558,12 @@ async def _build_presentation_markdown(company_name: str, vcc_items: list[dict])
     ]
     eligible_items = [item for item in normalized_items if _is_ppt_candidate(item)]
     if not eligible_items:
-        raise HTTPException(400, detail="無可產生簡報的候選項目")
+        raise AppError(
+            status_code=400,
+            error_code="NO_PPT_CANDIDATES",
+            message="無可產生簡報的候選項目",
+            retryable=False,
+        )
 
     categories = await categorizer.categorize_items(eligible_items)
     level_lookup = {
@@ -436,7 +612,7 @@ async def _build_presentation_markdown(company_name: str, vcc_items: list[dict])
         system_prompt=ppt_prompt,
         user_prompt=f"請根據以下數據生成簡報 Markdown：\n\n{''.join(summary_lines)}",
         tier="strong",
-        max_tokens=4096,
+        max_tokens=PPT_MARKDOWN_MAX_TOKENS,
     )
     presentation_markdown = presentation_markdown.strip()
     return {
@@ -453,9 +629,19 @@ async def generate_markdown(data: dict):
     vcc_items = data.get("vcc_items", [])
 
     if not company_name:
-        raise HTTPException(400, detail="缺少 company_name")
+        raise AppError(
+            status_code=400,
+            error_code="INVALID_REQUEST",
+            message="缺少 company_name",
+            retryable=False,
+        )
     if not vcc_items:
-        raise HTTPException(400, detail="無 VCC 可行項目")
+        raise AppError(
+            status_code=400,
+            error_code="NO_PPT_CANDIDATES",
+            message="無 VCC 可行項目",
+            retryable=False,
+        )
 
     generated = await _build_presentation_markdown(company_name=company_name, vcc_items=vcc_items)
     return {
@@ -475,9 +661,20 @@ async def generate_gamma_from_markdown(data: dict):
     num_cards = data.get("num_cards", 7)
 
     if not company_name:
-        raise HTTPException(400, detail="缺少 company_name")
+        raise AppError(
+            status_code=400,
+            error_code="INVALID_REQUEST",
+            message="缺少 company_name",
+            retryable=False,
+        )
     if not markdown_content:
-        raise HTTPException(400, detail="缺少 markdown_content")
+        raise AppError(
+            status_code=400,
+            error_code="INVALID_REQUEST",
+            message="缺少 markdown_content",
+            retryable=False,
+        )
+    _validate_gamma_input_length(markdown_content)
 
     result = await generate_presentation(
         text=markdown_content,

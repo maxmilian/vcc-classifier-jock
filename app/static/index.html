@@ -69,6 +69,10 @@
   .mode-row { display: flex; gap: 16px; margin-bottom: 12px; }
   .mode-row label { display: flex; gap: 6px; align-items: center; font-weight: 500; margin-bottom: 0; }
   .hidden { display: none; }
+  .resume-box { border: 1px solid #f1d7b8; background: #fff7ef; border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+  .resume-box .actions { margin-top: 8px; }
+  .inline-row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .inline-row input[type="text"] { margin-bottom: 0; flex: 1; min-width: 220px; }
   .job-logs { margin-top: 8px; background: #0f172a; color: #d1e3ff; border-radius: 8px; padding: 10px; max-height: 180px; overflow-y: auto; font-size: 0.8rem; line-height: 1.45; }
   .markdown-box { width: 100%; min-height: 280px; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 0.9rem; line-height: 1.5; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
 </style>
@@ -101,7 +105,21 @@
     </div>
     <label for="csvFile" id="csvLabel">費用 CSV 檔案（未標註 VCC適用等級）</label>
     <input type="file" id="csvFile" accept=".csv">
+    <div class="resume-box hidden" id="resumePrompt">
+      <p class="hint" id="resumePromptText"></p>
+      <div class="actions">
+        <button class="btn btn-secondary" type="button" id="btnResumeStoredJob" onclick="resumeStoredAnalyzeJob()">繼續查詢</button>
+        <button class="btn btn-outline" type="button" id="btnDiscardStoredJob" onclick="discardStoredAnalyzeJob()">放棄此任務</button>
+      </div>
+    </div>
+    <div class="inline-row">
+      <input type="text" id="manualJobIdInput" placeholder="手動輸入 job_id 查詢分析任務">
+      <button class="btn btn-secondary" type="button" id="btnLookupJob" onclick="lookupAnalyzeJobById()">查詢 job_id</button>
+    </div>
     <p class="error" id="step1Error"></p>
+    <div class="actions hidden" id="analyzeFailureActions">
+      <button class="btn btn-primary" type="button" onclick="resetAnalyzeAfterFailure()">重新分析</button>
+    </div>
     <div class="loading" id="step1Loading">
       <div class="spinner"></div>
       <span id="step1LoadingText">正在分析中，請稍候...</span>
@@ -128,7 +146,7 @@
     </div>
     <div class="table-wrap">
       <table id="resultTable">
-        <thead><tr><th>公司名稱</th><th>費用項目名稱</th><th>金額累計</th><th>交易筆數</th><th>VCC適用等級</th></tr></thead>
+        <thead><tr><th>公司名稱</th><th>費用項目名稱</th><th>金額累計</th><th>交易筆數</th><th>VCC適用等級</th><th>VCC判定狀態</th></tr></thead>
         <tbody id="resultBody"></tbody>
       </table>
     </div>
@@ -178,6 +196,136 @@ let currentTargetCompany = '';
 let reportCacheByCompany = {};
 let gammaPollingByCompany = {};
 let activeDataVersion = 0;
+let pendingStoredJobId = '';
+
+const ANALYZE_JOB_STORAGE_KEY = 'vcc_analyze_job_resume_v1';
+const TERMINAL_JOB_STATUSES = ['completed', 'failed', 'cancelled'];
+
+function getVccJudgeStatus(item) {
+  return (item['VCC判定狀態'] || '').trim();
+}
+
+function formatIsoTime(iso) {
+  if (!iso) return '';
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return iso;
+  return dt.toLocaleString('zh-TW', { hour12: false });
+}
+
+function normalizeApiErrorPayload(payload, fallbackMessage) {
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const message = String(
+    source.message || source.detail || fallbackMessage || '請求失敗'
+  ).trim();
+  const errorCode = String(source.error_code || '').trim();
+  const retryable = Boolean(source.retryable);
+  const providerStatus = source.provider_status;
+  return { message, error_code: errorCode, retryable, provider_status: providerStatus };
+}
+
+async function parseApiErrorResponse(res, fallbackMessage) {
+  let payload = null;
+  try {
+    payload = await res.json();
+  } catch (err) {
+    payload = null;
+  }
+  return normalizeApiErrorPayload(payload, fallbackMessage);
+}
+
+function getApiErrorSuggestion(errorCode) {
+  const tips = {
+    TOKEN_LIMIT_INPUT: '建議縮小批次、精簡輸入內容。',
+    TOKEN_LIMIT_OUTPUT: '建議降低輸出規模或縮小批次。',
+    CONTENT_BLOCKED: '請調整內容描述，避開政策阻擋內容。',
+    RATE_LIMITED: '請稍後重試。',
+    UPSTREAM_TIMEOUT: '可稍後重試，或縮小資料規模。',
+    GAMMA_INPUT_TOO_LARGE: '請精簡 Markdown 或拆成多次生成。',
+    ANALYZE_JOB_NOT_FOUND: '請確認 job_id 是否正確。',
+  };
+  return tips[errorCode] || '';
+}
+
+function formatApiErrorForUser(apiErr) {
+  if (!apiErr) return '請求失敗';
+  const suggestion = getApiErrorSuggestion(apiErr.error_code || '');
+  if (!suggestion) return apiErr.message || '請求失敗';
+  return `${apiErr.message}（${suggestion}）`;
+}
+
+function setStep1Error(message) {
+  document.getElementById('step1Error').textContent = message || '';
+}
+
+function showAnalyzeFailureActions(visible) {
+  document.getElementById('analyzeFailureActions').classList.toggle('hidden', !visible);
+}
+
+function readStoredAnalyzeJob() {
+  try {
+    const raw = localStorage.getItem(ANALYZE_JOB_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const jobId = String(parsed.job_id || '').trim();
+    if (!jobId) return null;
+    return {
+      job_id: jobId,
+      created_at: String(parsed.created_at || '').trim(),
+      upload_filename: String(parsed.upload_filename || '').trim(),
+      source_mode: String(parsed.source_mode || 'analyze').trim() || 'analyze',
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+function persistAnalyzeJob(info) {
+  if (!info || !info.job_id) return;
+  const payload = {
+    job_id: String(info.job_id).trim(),
+    created_at: String(info.created_at || '').trim(),
+    upload_filename: String(info.upload_filename || '').trim(),
+    source_mode: String(info.source_mode || 'analyze').trim() || 'analyze',
+  };
+  localStorage.setItem(ANALYZE_JOB_STORAGE_KEY, JSON.stringify(payload));
+}
+
+function clearStoredAnalyzeJob() {
+  localStorage.removeItem(ANALYZE_JOB_STORAGE_KEY);
+  pendingStoredJobId = '';
+  hideResumePrompt();
+}
+
+function showResumePrompt(jobInfo) {
+  if (!jobInfo || !jobInfo.job_id) return;
+  pendingStoredJobId = jobInfo.job_id;
+  const created = jobInfo.created_at ? `建立於 ${formatIsoTime(jobInfo.created_at)}` : '建立時間未知';
+  const filename = jobInfo.upload_filename ? `，檔名 ${jobInfo.upload_filename}` : '';
+  document.getElementById('resumePromptText').textContent =
+    `偵測到未完成分析任務 ${jobInfo.job_id}（${created}${filename}）。`;
+  document.getElementById('resumePrompt').classList.remove('hidden');
+}
+
+function hideResumePrompt() {
+  document.getElementById('resumePrompt').classList.add('hidden');
+}
+
+function discardStoredAnalyzeJob() {
+  clearStoredAnalyzeJob();
+  setStep1Error('');
+  showAnalyzeFailureActions(false);
+}
+
+function resetAnalyzeAfterFailure() {
+  analyzeJobId = '';
+  setStep1Error('');
+  showAnalyzeFailureActions(false);
+  document.getElementById('analyzeProgress').classList.add('hidden');
+  document.getElementById('analyzeMeta').textContent = '';
+  document.getElementById('analyzeLogs').textContent = '';
+  setStep(1);
+}
 
 function getSelectedMode() {
   const selected = document.querySelector('input[name="uploadMode"]:checked');
@@ -192,6 +340,10 @@ function onModeChange() {
   document.getElementById('analyzeProgress').classList.add('hidden');
   document.getElementById('analyzeMeta').textContent = '';
   document.getElementById('analyzeLogs').textContent = '';
+  showAnalyzeFailureActions(false);
+  if (!isAnalyzeMode) {
+    hideResumePrompt();
+  }
   document.getElementById('csvLabel').textContent = isAnalyzeMode
     ? '請上傳含所有公司費用的CSV 檔案（未標註 VCC適用等級）'
     : '請上傳以分析完畢的費用檔案（需含 VCC適用等級）';
@@ -390,13 +542,13 @@ async function analyze() {
   const isAnalyzeMode = mode === 'analyze';
   const name = document.getElementById('companyName').value.trim();
   const file = document.getElementById('csvFile').files[0];
-  const errEl = document.getElementById('step1Error');
-  errEl.textContent = '';
+  setStep1Error('');
+  showAnalyzeFailureActions(false);
   selectedReportCompany = '';
   currentTargetCompany = '';
 
   if (!file) {
-    errEl.textContent = '請上傳 CSV 檔案';
+    setStep1Error('請上傳 CSV 檔案');
     return;
   }
   resetPresentationCaches();
@@ -418,73 +570,224 @@ async function analyze() {
 
   try {
     if (isAnalyzeMode) {
-      analyzeResult = await runAnalyzeJob(fd);
+      clearStoredAnalyzeJob();
+      analyzeResult = await runAnalyzeJob(fd, file.name || '');
     } else {
       const res = await fetch('/api/prepare-presentation-csv', { method: 'POST', body: fd });
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || '載入失敗');
+        const apiErr = await parseApiErrorResponse(res, '載入失敗');
+        throw new Error(formatApiErrorForUser(apiErr));
       }
       analyzeResult = await res.json();
       if (!analyzeResult.source_mode) {
         analyzeResult.source_mode = 'ppt_ready';
       }
+      clearStoredAnalyzeJob();
     }
 
     renderStep2();
     setStep(2);
   } catch (e) {
-    errEl.textContent = e.message;
+    setStep1Error(e.message || '分析失敗');
   } finally {
     btn.disabled = false;
     document.getElementById('step1Loading').classList.remove('show');
   }
 }
 
-async function runAnalyzeJob(formData) {
+async function fetchAnalyzeJobStatus(jobId) {
+  const statusRes = await fetch(`/api/analyze-jobs/${encodeURIComponent(jobId)}`);
+  if (!statusRes.ok) {
+    const apiErr = await parseApiErrorResponse(statusRes, '讀取分析進度失敗');
+    const error = new Error(formatApiErrorForUser(apiErr));
+    error.apiError = apiErr;
+    throw error;
+  }
+  return statusRes.json();
+}
+
+function getAnalyzeFailureMessage(status) {
+  const jobError = String(status?.error || '').trim();
+  if (jobError) return `分析任務失敗：${jobError}`;
+  return '分析任務失敗';
+}
+
+function applyAnalyzeJobResult(status) {
+  if (!status || !status.result) {
+    throw new Error('分析完成但找不到結果');
+  }
+  analyzeResult = status.result;
+  if (!analyzeResult.source_mode) {
+    analyzeResult.source_mode = 'analyze';
+  }
+  showAnalyzeFailureActions(false);
+  setStep1Error('');
+  clearStoredAnalyzeJob();
+  renderStep2();
+  setStep(2);
+}
+
+function applyAnalyzeJobFailure(status) {
+  showAnalyzeFailureActions(true);
+  setStep1Error(getAnalyzeFailureMessage(status));
+  clearStoredAnalyzeJob();
+}
+
+async function waitAnalyzeJobUntilTerminal(jobId) {
+  while (true) {
+    await sleep(2000);
+    const status = await fetchAnalyzeJobStatus(jobId);
+    renderAnalyzeJobStatus(status);
+    if (TERMINAL_JOB_STATUSES.includes(String(status.status || '').trim())) {
+      return status;
+    }
+  }
+}
+
+async function runAnalyzeJob(formData, uploadFilename = '') {
   const startRes = await fetch('/api/analyze', { method: 'POST', body: formData });
   if (!startRes.ok) {
-    const err = await startRes.json();
-    throw new Error(err.detail || '分析任務建立失敗');
+    const apiErr = await parseApiErrorResponse(startRes, '分析任務建立失敗');
+    throw new Error(formatApiErrorForUser(apiErr));
   }
   const started = await startRes.json();
   analyzeJobId = started.job_id;
+  persistAnalyzeJob({
+    job_id: started.job_id,
+    created_at: started.created_at || '',
+    upload_filename: uploadFilename,
+    source_mode: 'analyze',
+  });
+  hideResumePrompt();
 
   document.getElementById('cacheDownloadLink').href = `/api/analyze-jobs/${encodeURIComponent(analyzeJobId)}/cache`;
   document.getElementById('analyzeMeta').textContent =
     `總筆數 ${started.total_rows}，唯一項目 ${started.unique_items}，批次 ${started.total_batches}，預估約 ${started.estimated_seconds} 秒`;
 
-  while (true) {
-    await new Promise(r => setTimeout(r, 2000));
-
-    const statusRes = await fetch(`/api/analyze-jobs/${encodeURIComponent(analyzeJobId)}`);
-    if (!statusRes.ok) {
-      throw new Error('讀取分析進度失敗');
+  const status = await waitAnalyzeJobUntilTerminal(analyzeJobId);
+  if (status.status === 'completed') {
+    if (!status.result) {
+      throw new Error('分析完成但找不到結果');
     }
-    const status = await statusRes.json();
+    clearStoredAnalyzeJob();
+    return status.result;
+  }
+  applyAnalyzeJobFailure(status);
+  throw new Error(getAnalyzeFailureMessage(status));
+}
+
+async function resumeAnalyzeJob(jobId) {
+  if (!jobId) return;
+  setStep1Error('');
+  showAnalyzeFailureActions(false);
+  document.getElementById('step1Loading').classList.add('show');
+  document.getElementById('step1LoadingText').textContent = '正在接續分析任務...';
+  document.getElementById('analyzeProgress').classList.remove('hidden');
+  document.getElementById('cacheDownloadLink').style.display = 'inline';
+  analyzeJobId = jobId;
+  document.getElementById('cacheDownloadLink').href = `/api/analyze-jobs/${encodeURIComponent(analyzeJobId)}/cache`;
+
+  try {
+    let status = await fetchAnalyzeJobStatus(jobId);
     renderAnalyzeJobStatus(status);
 
-    if (status.status === 'completed') {
-      if (!status.result) {
-        throw new Error('分析完成但找不到結果');
-      }
-      return status.result;
+    const statusName = String(status.status || '').trim();
+    if (!TERMINAL_JOB_STATUSES.includes(statusName)) {
+      persistAnalyzeJob({
+        job_id: status.job_id || jobId,
+        created_at: status.created_at || '',
+        source_mode: 'analyze',
+      });
+      hideResumePrompt();
+      status = await waitAnalyzeJobUntilTerminal(jobId);
     }
-    if (status.status === 'failed') {
-      throw new Error(status.error || '分析任務失敗');
+
+    if (status.status === 'completed') {
+      applyAnalyzeJobResult(status);
+    } else {
+      applyAnalyzeJobFailure(status);
+    }
+  } catch (err) {
+    setStep1Error(err.message || '接續分析任務失敗');
+    if ((err.apiError || {}).error_code === 'ANALYZE_JOB_NOT_FOUND') {
+      clearStoredAnalyzeJob();
+    }
+  } finally {
+    document.getElementById('step1Loading').classList.remove('show');
+  }
+}
+
+async function resumeStoredAnalyzeJob() {
+  const stored = readStoredAnalyzeJob();
+  const jobId = pendingStoredJobId || (stored ? stored.job_id : '');
+  if (!jobId) {
+    setStep1Error('找不到可接續的 job_id');
+    return;
+  }
+  await resumeAnalyzeJob(jobId);
+}
+
+async function lookupAnalyzeJobById() {
+  const input = document.getElementById('manualJobIdInput');
+  const jobId = (input.value || '').trim();
+  if (!jobId) {
+    setStep1Error('請先輸入 job_id');
+    return;
+  }
+  persistAnalyzeJob({ job_id: jobId, source_mode: 'analyze' });
+  await resumeAnalyzeJob(jobId);
+}
+
+async function checkStoredAnalyzeJobOnLoad() {
+  const stored = readStoredAnalyzeJob();
+  if (!stored || stored.source_mode !== 'analyze') return;
+
+  try {
+    const status = await fetchAnalyzeJobStatus(stored.job_id);
+    const statusName = String(status.status || '').trim();
+    if (statusName === 'completed') {
+      applyAnalyzeJobResult(status);
+      return;
+    }
+    if (statusName === 'failed' || statusName === 'cancelled') {
+      applyAnalyzeJobFailure(status);
+      return;
+    }
+    persistAnalyzeJob({
+      job_id: status.job_id || stored.job_id,
+      created_at: status.created_at || stored.created_at || '',
+      upload_filename: stored.upload_filename || '',
+      source_mode: 'analyze',
+    });
+    showResumePrompt(readStoredAnalyzeJob());
+  } catch (err) {
+    if ((err.apiError || {}).error_code === 'ANALYZE_JOB_NOT_FOUND') {
+      clearStoredAnalyzeJob();
+    } else {
+      showResumePrompt(stored);
     }
   }
 }
 
 function renderAnalyzeJobStatus(status) {
-  const progressText = `${status.phase} ${status.processed_batches}/${status.total_batches} 批 (${status.progress_pct}%)`;
-  document.getElementById('step1LoadingText').textContent = `分析中：${progressText}`;
+  const phase = String(status.phase || status.status || '').trim();
+  const processed = Number(status.processed_batches || 0);
+  const total = Number(status.total_batches || 0);
+  const progress = Number(status.progress_pct || 0);
+  const progressText = `${phase} ${processed}/${total} 批 (${progress}%)`;
+  if (String(status.status || '').trim() === 'completed') {
+    document.getElementById('step1LoadingText').textContent = '分析已完成，正在載入結果...';
+  } else if (String(status.status || '').trim() === 'failed') {
+    document.getElementById('step1LoadingText').textContent = '分析任務失敗';
+  } else {
+    document.getElementById('step1LoadingText').textContent = `分析中：${progressText}`;
+  }
 
   const remaining = typeof status.estimated_seconds_remaining === 'number'
     ? status.estimated_seconds_remaining
     : 0;
   document.getElementById('analyzeMeta').textContent =
-    `總筆數 ${status.total_rows}，唯一項目 ${status.unique_items}，已跑 ${status.processed_batches}/${status.total_batches} 批，預估剩餘 ${remaining} 秒`;
+    `總筆數 ${status.total_rows}，唯一項目 ${status.unique_items}，已跑 ${processed}/${total} 批，預估剩餘 ${remaining} 秒`;
 
   const stageLogs = status.stage_logs || [];
   const lines = stageLogs.slice(-12).map(log => {
@@ -509,6 +812,19 @@ function renderStep2() {
   const countConditional = Number(levelCounts['條件適合'] || 0);
   const countReview = Number(levelCounts['需釐清'] || 0);
   const countNo = Number(levelCounts['不適合'] || 0);
+  const derivedStatusCounts = (r.items || []).reduce((acc, item) => {
+    const status = getVccJudgeStatus(item) || (getVccLevel(item) ? '模型判定' : '未分析');
+    acc[status] = Number(acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  const statusCounts = Object.keys(r.vcc_status_counts || {}).length
+    ? r.vcc_status_counts
+    : derivedStatusCounts;
+  const countModel = Number(statusCounts['模型判定'] || 0);
+  const countImported = Number(statusCounts['外部匯入'] || 0);
+  const countFallback = Number(statusCounts['系統回退'] || 0);
+  const countUnanalyzed = Number(statusCounts['未分析'] || 0);
+  const countFailed = Number(statusCounts['分析失敗'] || 0);
 
   document.getElementById('statsArea').innerHTML = `
     <div class="stat-card"><div class="value">${r.total_items}</div><div class="label">總項目數</div></div>
@@ -517,6 +833,11 @@ function renderStep2() {
     <div class="stat-card level-conditional"><div class="value">${countConditional}</div><div class="label">條件適合</div></div>
     <div class="stat-card level-review"><div class="value">${countReview}</div><div class="label">需釐清</div></div>
     <div class="stat-card level-no"><div class="value">${countNo}</div><div class="label">不適合</div></div>
+    <div class="stat-card"><div class="value">${countModel}</div><div class="label">模型判定</div></div>
+    <div class="stat-card"><div class="value">${countImported}</div><div class="label">外部匯入</div></div>
+    <div class="stat-card"><div class="value">${countFallback}</div><div class="label">系統回退</div></div>
+    <div class="stat-card"><div class="value">${countUnanalyzed}</div><div class="label">未分析</div></div>
+    <div class="stat-card"><div class="value">${countFailed}</div><div class="label">分析失敗</div></div>
     <div class="stat-card"><div class="value">${candidateCount}</div><div class="label">簡報候選</div></div>
   `;
   const tbody = document.getElementById('resultBody');
@@ -526,7 +847,8 @@ function renderStep2() {
       <td>${escapeHtml(item['費用項目名稱'] || '')}</td>
       <td>${formatNumber(item['金額累計'] || 0)}</td>
       <td>${escapeHtml(item['交易筆數'] || '')}</td>
-      <td>${escapeHtml(item['VCC適用等級'] || '')}</td>
+      <td>${escapeHtml(item['VCC適用等級'] || '—')}</td>
+      <td>${escapeHtml(getVccJudgeStatus(item) || '未分析')}</td>
     </tr>
   `).join('');
 
@@ -681,8 +1003,8 @@ async function generateMarkdownPreview() {
     });
 
     if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || '產生 Markdown 失敗');
+      const apiErr = await parseApiErrorResponse(res, '產生 Markdown 失敗');
+      throw new Error(formatApiErrorForUser(apiErr));
     }
     const result = await res.json();
     state.markdown = result.markdown_preview || '';
@@ -747,8 +1069,8 @@ async function sendToGamma() {
     });
 
     if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || '送出 Gamma 失敗');
+      const apiErr = await parseApiErrorResponse(res, '送出 Gamma 失敗');
+      throw new Error(formatApiErrorForUser(apiErr));
     }
 
     const result = await res.json();
@@ -800,7 +1122,10 @@ async function startGammaPolling(companyName, generationId, dataVersion) {
 
     try {
       const res = await fetch(`/api/gamma-status/${generationId}`);
-      if (!res.ok) throw new Error('查詢 Gamma 狀態失敗');
+      if (!res.ok) {
+        const apiErr = await parseApiErrorResponse(res, '查詢 Gamma 狀態失敗');
+        throw new Error(formatApiErrorForUser(apiErr));
+      }
       const result = await res.json();
       failCount = 0;
 
@@ -899,6 +1224,13 @@ function initStepperNavigation() {
 
 onModeChange();
 initStepperNavigation();
+document.getElementById('manualJobIdInput').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    lookupAnalyzeJobById();
+  }
+});
+checkStoredAnalyzeJobOnLoad();
 </script>
 </body>
 </html>

@@ -9,6 +9,7 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from app.config import settings
 from app.services.llm import complete as llm_complete
 
 logger = logging.getLogger(__name__)
@@ -16,9 +17,13 @@ logger = logging.getLogger(__name__)
 _filter_prompt_cache: str | None = None
 ALLOWED_LABELS_5 = {"絕對適合", "高度適合", "條件適合", "需釐清", "不適合"}
 ALLOWED_LABELS = ALLOWED_LABELS_5
-DEFAULT_BATCH_SIZE = 120
+DEFAULT_BATCH_SIZE = max(1, int(settings.analyze_batch_size))
+DEFAULT_ANALYZE_MAX_TOKENS = max(256, int(settings.analyze_max_tokens))
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_WAIT_SECONDS = 1.5
+JUDGE_STATUS_MODEL = "模型判定"
+JUDGE_STATUS_FALLBACK = "系統回退"
+JUDGE_STATUS_UNANALYZED = "未分析"
 
 
 def _load_filter_prompt() -> str:
@@ -133,16 +138,12 @@ def _validate_batch_result(
 
 def _build_batch_user_prompt(items: list[str], batch_index: int, total_batches: int) -> str:
     payload = {
-        "task": "請判斷每個費用項目是否適合 VCC，僅回傳合法 JSON Array。",
+        "task": "請判斷每個費用項目是否適合 VCC，僅回傳合法 JSON object。",
         "batch_index": batch_index,
         "total_batches": total_batches,
         "items": items,
         "allowed_values": ["絕對適合", "高度適合", "條件適合", "需釐清", "不適合"],
-        "output_format": [
-            {"companyName": "", "itemName": "交通費", "isVccSuitable": "高度適合"},
-            {"companyName": "", "itemName": "房租", "isVccSuitable": "不適合"},
-            {"companyName": "", "itemName": "雜費", "isVccSuitable": "需釐清"},
-        ],
+        "output_format": {"交通費": "高度適合", "房租": "不適合", "雜費": "需釐清"},
     }
     return json.dumps(payload, ensure_ascii=False)
 
@@ -151,7 +152,7 @@ def _normalize_vcc_label(raw_label: str) -> str:
     level = _to_level_label(str(raw_label).strip())
     if level in ALLOWED_LABELS:
         return level
-    return "需釐清"
+    return ""
 
 
 def _to_level_label(raw_label: str) -> str:
@@ -172,6 +173,7 @@ async def _classify_single_batch(
     batch_index: int,
     total_batches: int,
     max_retries: int,
+    max_tokens: int,
 ) -> tuple[dict[str, str], dict]:
     attempt_logs = []
     last_error = ""
@@ -183,7 +185,7 @@ async def _classify_single_batch(
                 system_prompt=_load_filter_prompt(),
                 user_prompt=_build_batch_user_prompt(items, batch_index, total_batches),
                 tier="fast",
-                max_tokens=4096,
+                max_tokens=max_tokens,
             )
             parsed = _parse_model_json(raw)
             cleaned, missing, invalid, extra = _validate_batch_result(parsed, items)
@@ -215,8 +217,7 @@ async def _classify_single_batch(
             if attempt < max_retries:
                 await asyncio.sleep(min(DEFAULT_RETRY_WAIT_SECONDS * attempt, 5.0))
 
-    fallback = {item: "需釐清" for item in items}
-    return fallback, {
+    return {}, {
         "batch_index": batch_index,
         "total_batches": total_batches,
         "status": "failed_fallback",
@@ -231,6 +232,7 @@ async def _classify_single_batch(
 async def classify_items_in_batches(
     rows: list[dict],
     batch_size: int = DEFAULT_BATCH_SIZE,
+    max_tokens: int = DEFAULT_ANALYZE_MAX_TOKENS,
     max_retries: int = DEFAULT_MAX_RETRIES,
     progress_callback: Callable[[dict], Awaitable[None] | None] | None = None,
 ) -> tuple[list[dict], dict]:
@@ -239,6 +241,8 @@ async def classify_items_in_batches(
         raise ValueError("batch_size 必須大於 0")
     if max_retries <= 0:
         raise ValueError("max_retries 必須大於 0")
+    if max_tokens <= 0:
+        raise ValueError("max_tokens 必須大於 0")
 
     unique_items: list[str] = []
     seen: set[str] = set()
@@ -253,7 +257,8 @@ async def classify_items_in_batches(
         merged = []
         for row in rows:
             new_row = dict(row)
-            new_row["VCC適用等級"] = "需釐清"
+            new_row["VCC適用等級"] = ""
+            new_row["VCC判定狀態"] = JUDGE_STATUS_UNANALYZED
             merged.append(new_row)
         return merged, {
             "summary": {
@@ -273,6 +278,7 @@ async def classify_items_in_batches(
     lookup: dict[str, str] = {}
     batch_records: list[dict] = []
     fallback_items = 0
+    fallback_item_names: set[str] = set()
 
     for idx, batch_items in enumerate(batches, start=1):
         batch_lookup, record = await _classify_single_batch(
@@ -280,10 +286,14 @@ async def classify_items_in_batches(
             batch_index=idx,
             total_batches=len(batches),
             max_retries=max_retries,
+            max_tokens=max_tokens,
         )
         lookup.update(batch_lookup)
         batch_records.append(record)
-        fallback_items += int(record.get("fallback_count", 0))
+        fallback_count = int(record.get("fallback_count", 0))
+        fallback_items += fallback_count
+        if fallback_count > 0:
+            fallback_item_names.update(batch_items)
 
         if progress_callback is not None:
             payload = {
@@ -298,14 +308,27 @@ async def classify_items_in_batches(
                 await maybe_awaitable
 
     merged = []
+    status_counts = {
+        JUDGE_STATUS_MODEL: 0,
+        JUDGE_STATUS_FALLBACK: 0,
+        JUDGE_STATUS_UNANALYZED: 0,
+    }
     for row in rows:
         new_row = dict(row)
         item_name = str(row.get("費用項目名稱", "")).strip()
-        raw_label = lookup.get(item_name, "需釐清")
+        raw_label = lookup.get(item_name, "")
         level = _normalize_vcc_label(raw_label)
+        if level:
+            status = JUDGE_STATUS_MODEL
+        elif item_name and item_name in fallback_item_names:
+            status = JUDGE_STATUS_FALLBACK
+        else:
+            status = JUDGE_STATUS_UNANALYZED
         new_row["VCC適用等級"] = level
+        new_row["VCC判定狀態"] = status
         new_row.pop("VCC判斷", None)
         merged.append(new_row)
+        status_counts[status] = int(status_counts.get(status, 0)) + 1
 
     summary = {
         "total_rows": len(rows),
@@ -314,6 +337,7 @@ async def classify_items_in_batches(
         "processed_batches": len(batches),
         "classified_items": len(lookup),
         "fallback_items": fallback_items,
+        "judge_status_counts": status_counts,
     }
     logger.info(
         "批次分類完成: rows=%d unique=%d batches=%d fallback=%d",
@@ -343,7 +367,7 @@ async def classify_items(
         system_prompt=_load_filter_prompt(),
         user_prompt=user_prompt,
         tier="fast",
-        max_tokens=4096,
+        max_tokens=DEFAULT_ANALYZE_MAX_TOKENS,
     )
     parsed = _parse_model_json(raw)
     if not isinstance(parsed, list):
@@ -364,9 +388,10 @@ def merge_results(
     for row in rows:
         new_row = dict(row)
         item_name = row.get("費用項目名稱", "")
-        raw_label = lookup.get(item_name, "需釐清")
+        raw_label = lookup.get(item_name, "")
         level = _normalize_vcc_label(raw_label)
         new_row["VCC適用等級"] = level
+        new_row["VCC判定狀態"] = JUDGE_STATUS_MODEL if level else JUDGE_STATUS_UNANALYZED
         new_row.pop("VCC判斷", None)
         merged.append(new_row)
     return merged
