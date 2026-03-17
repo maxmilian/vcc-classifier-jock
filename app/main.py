@@ -303,9 +303,13 @@ async def index():
 
 @app.get("/health")
 async def health():
-    from importlib.metadata import version
+    from importlib.metadata import version, PackageNotFoundError
 
-    return {"status": "ok", "version": version("vcc-classifier-jock")}
+    try:
+        ver = version("vcc-classifier-jock")
+    except PackageNotFoundError:
+        ver = "unknown"
+    return {"status": "ok", "version": ver}
 
 
 @app.post("/api/analyze")
