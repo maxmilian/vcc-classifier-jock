@@ -303,7 +303,9 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    from importlib.metadata import version
+
+    return {"status": "ok", "version": version("vcc-classifier-jock")}
 
 
 @app.post("/api/analyze")
