@@ -303,12 +303,10 @@ async def index():
 
 @app.get("/health")
 async def health():
-    from importlib.metadata import version, PackageNotFoundError
+    import tomllib
 
-    try:
-        ver = version("vcc-classifier-jock")
-    except PackageNotFoundError:
-        ver = "unknown"
+    with open("pyproject.toml", "rb") as f:
+        ver = tomllib.load(f)["project"]["version"]
     return {"status": "ok", "version": ver}
 
 
