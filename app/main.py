@@ -303,11 +303,7 @@ async def index():
 
 @app.get("/health")
 async def health():
-    import tomllib
-
-    with open("pyproject.toml", "rb") as f:
-        ver = tomllib.load(f)["project"]["version"]
-    return {"status": "ok", "version": ver}
+    return {"status": "ok", "version": "0.1.0", "updated_at": "2026-03-17"}
 
 
 @app.post("/api/analyze")

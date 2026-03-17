@@ -61,7 +61,7 @@ PPT 模式（上傳已標註檔）另外需要：
 | Method | Path | 說明 |
 |--------|------|------|
 | `GET` | `/` | Web UI |
-| `GET` | `/health` | 健康檢查 |
+| `GET` | `/health` | 健康檢查（回傳 `version`、`updated_at`） |
 | `POST` | `/api/analyze` | 上傳 CSV 建立分析任務（回傳 `job_id`） |
 | `GET` | `/api/analyze-jobs/{job_id}` | 查詢多段分析進度與結果 |
 | `GET` | `/api/analyze-jobs/{job_id}/cache` | 下載任務快取紀錄 JSON |
